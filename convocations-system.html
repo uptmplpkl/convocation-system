@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistem Check-In Convocation</title>
+    <style>
+        /* CSS yang sama seperti sebelumnya */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* ... (CSS sedia ada kekal sama) ... */
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- HEADER -->
+        <div class="header">
+            <h1>Sistem Check-In Kehadiran Tetamu Convocation</h1>
+            <p>Pusat Latihan Polis Kuala Lumpur</p>
+            <button onclick="exportData()" class="export-btn" id="exportBtn" disabled>
+                Export Data CSV
+            </button>
+        </div>
+
+        <!-- TAMBAH INPUT UNTUK GOOGLE SHEETS LINK -->
+        <div class="import-section">
+            <h2 class="import-title">Sambungan ke Google Sheets</h2>
+            <div class="form-group">
+                <label for="sheetLink">Pautan Google Sheets (Dikongsi):</label>
+                <input type="text" id="sheetLink" placeholder="https://docs.google.com/spreadsheets/d/..." 
+                       style="width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #ccc;">
+            </div>
+            <button class="upload-btn" onclick="connectToSheet()" style="margin-top: 10px;">
+                Sambung ke Google Sheets
+            </button>
+            <div class="status-message" id="connectionStatus"></div>
+        </div>
+
+        <!-- ... (BAKI HTML YANG SAMA) ... -->
+    </div>
+
+    <!-- SheetJS Library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <!-- Google Apps Script API -->
+    <script src="https://apis.google.com/js/api.js"></script>
+
+    <script>
+        // ============================================
+        // ONLINE CONVOCATION SYSTEM - MULTI-USER
+        // ============================================
+        
+        // Global variables
+        let graduates = [];
+        let selectedGraduate = null;
+        let attendanceHistory = [];
+        let currentFilter = 'semua';
+        let previewData = null;
+        let searchTimeout = null;
+        let isProcessing = false;
+        let systemReady = false;
+        let googleSheetLink = '';
+
+        // Constants
+        const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+        const ALLOWED_FILE_TYPES = ['.xlsx', '.xls'];
+        const DEBOUNCE_DELAY = 300;
+        const STUDENT_ID_PATTERN = /^[A-Za-z]\d+$/;
+
+        // Fungsi untuk sambung ke Google Sheets
+        function connectToSheet() {
+            const sheetLink = document.getElementById('sheetLink').value.trim();
+            if (!sheetLink) {
+                showMessage('error', 'Sila masukkan pautan Google Sheets');
+                return;
+            }
+
+            // Extract Google Sheets ID dari URL
+            const match = sheetLink.match(/\/d\/([a-zA-Z0-9-_]+)/);
+            if (!match || !match[1]) {
+                showMessage('error', 'Pautan Google Sheets tidak sah');
+                return;
+            }
+
+            googleSheetLink = sheetLink;
+            const sheetId = match[1];
+            
+            setLoadingState(true);
+            showMessage('warning', 'Menyambung ke Google Sheets...', false);
+
+            // Load data dari Google Sheets
+            loadDataFromGoogleSheet(sheetId);
+        }
+
+        // Fungsi untuk load data dari Google Sheets menggunakan JSONP
+        function loadDataFromGoogleSheet(sheetId) {
+            // URL untuk Google Sheets dalam format CSV (publik)
+            const graduatesUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=Graduates`;
+            const attendanceUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=Attendance`;
+            
+            // Load data graduan
+            fetchCsv(graduatesUrl)
+                .then(csvData => {
+                    graduates = parseCsvData(csvData);
+                    return fetchCsv(attendanceUrl);
+                })
+                .then(csvData => {
+                    attendanceHistory = parseAttendanceData(csvData);
+                    showMessage('success', 'Data berjaya dimuat dari Google Sheets!');
+                    renderGraduates();
+                    refreshAttendanceLog();
+                    calculateStatistics();
+                    
+                    // Enable semua fungsi
+                    document.getElementById('searchInput').disabled = false;
+                    document.querySelector('.search-btn').disabled = false;
+                    document.getElementById('exportBtn').disabled = false;
+                    
+                    systemReady = true;
+                    setLoadingState(false);
+                })
+                .catch(error => {
+                    showMessage('error', 'Ralat memuat data: ' + error.message);
+                    setLoadingState(false);
+                });
+        }
+
+        // Fungsi untuk fetch data CSV
+        function fetchCsv(url) {
+            return fetch(url)
+                .then(response => {
+                    if (!response.ok) throw new Error('Rangkaian tidak berfungsi');
+                    return response.text();
+                });
+        }
+
+        // Fungsi untuk parse data CSV graduan
+        function parseCsvData(csvData) {
+            const rows = csvData.split('\n').slice(1); // Skip header
+            const graduates = [];
+            
+            for (let i = 0; i < rows.length; i++) {
+                const cells = rows[i].split(',').map(cell => 
+                    cell.trim().replace(/^"|"$/g, ''));
+                
+                if (cells.length >= 5 && cells[1]) { // Pastikan ada nama graduan
+                    graduates.push({
+                        id: cells[0] || i + 1,
+                        namaGraduan: cells[1],
+                        noBadan: cells[2],
+                        platun: cells[3],
+                        tetamu: {
+                            namaTetamu: cells[4],
+                            hubungan: cells[5],
+                            status: cells[6] || 'pending',
+                            namaPengganti: cells[7] || '',
+                            hubunganPengganti: cells[8] || ''
+                        }
+                    });
+                }
+            }
+            
+            return graduates;
+        }
+
+        // Fungsi untuk parse data CSV kehadiran
+        function parseAttendanceData(csvData) {
+            const rows = csvData.split('\n').slice(1); // Skip header
+            const attendance = [];
+            
+            for (let i = 0; i < rows.length; i++) {
+                const cells = rows[i].split(',').map(cell => 
+                    cell.trim().replace(/^"|"$/g, ''));
+                
+                if (cells.length >= 9 && cells[0]) { // Pastikan ada timestamp
+                    attendance.push({
+                        time: cells[0],
+                        graduanId: cells[1],
+                        graduan: cells[2],
+                        noBadan: cells[3],
+                        platun: cells[4],
+                        tetamu: cells[5],
+                        hubungan: cells[6],
+                        status: cells[7],
+                        pengganti: cells[8] || '-',
+                        hubunganPengganti: cells[9] || '-'
+                    });
+                }
+            }
+            
+            return attendance;
+        }
+
+        // Fungsi untuk save data ke Google Sheets (menggunakan FormSubmit)
+        function saveToGoogleSheet(data, sheetName) {
+            if (!googleSheetLink) {
+                showMessage('error', 'Sila sambung ke Google Sheets terlebih dahulu');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('sheetName', sheetName);
+            formData.append('data', JSON.stringify(data));
+            
+            // Ini adalah contoh sahaja - dalam praktikalnya, anda perlu buat
+            // Google Apps Script untuk terima data dan tulis ke sheet
+            showMessage('warning', 'Penyimpanan ke Google Sheets memerlukan setup Google Apps Script');
+        }
+
+        // Fungsi untuk export data
+        function exportData() {
+            if (!checkSystemReady() || attendanceHistory.length === 0 || isProcessing) {
+                showMessage('warning', 'Tiada data untuk export. Sila check-in tetamu terlebih dahulu.');
+                return;
+            }
+
+            try {
+                setLoadingState(true);
+
+                const headers = ['Masa', 'Graduan', 'No. Badan', 'Platun', 'Tetamu', 'Hubungan', 'Status', 'Pengganti', 'Hubungan Pengganti'];
+                let csvContent = headers.join(',') + '\n';
+
+                attendanceHistory.forEach(entry => {
+                    const row = [
+                        '"' + entry.time.replace(/"/g, '""') + '"',
+                        '"' + entry.graduan.replace(/"/g, '""') + '"',
+                        '"' + entry.noBadan.replace(/"/g, '""') + '"',
+                        '"' + entry.platun.replace(/"/g, '""') + '"',
+                        '"' + entry.tetamu.replace(/"/g, '""') + '"',
+                        '"' + entry.hubungan.replace(/"/g, '""') + '"',
+                        '"' + entry.status.replace(/"/g, '""') + '"',
+                        '"' + entry.pengganti.replace(/"/g, '""') + '"',
+                        '"' + entry.hubunganPengganti.replace(/"/g, '""') + '"'
+                    ];
+                    csvContent += row.join(',') + '\n';
+                });
+
+                const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                
+                link.setAttribute('href', url);
+                link.setAttribute('download', 'kehadiran_convocation.csv');
+                link.style.visibility = 'hidden';
+                
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                showMessage('success', 'Data berjaya diexport!');
+                
+            } catch (error) {
+                console.error('Export error:', error);
+                showMessage('error', 'Ralat export data: ' + error.message);
+            } finally {
+                setLoadingState(false);
+            }
+        }
+
+        // Fungsi untuk save check-in
+        function saveCheckIn() {
+            if (!checkSystemReady() || !selectedGraduate || isProcessing) return;
+
+            try {
+                setLoadingState(true);
+
+                const namaPenggantiInput = document.getElementById('namaPengganti');
+                const namaPengganti = namaPenggantiInput ? namaPenggantiInput.value.trim() : '';
+
+                const hubunganPenggantiInput = document.getElementById('hubunganPengganti');
+                const hubunganPengganti = hubunganPenggantiInput ? hubunganPenggantiInput.value.trim() : '';
+
+                if (namaPengganti.length > 100) {
+                    showMessage('error', 'Nama pengganti terlalu panjang (maksimum 100 aksara)');
+                    return;
+                }
+
+                // Update status graduan
+                selectedGraduate.tetamu.namaPengganti = namaPengganti;
+                selectedGraduate.tetamu.hubunganPengganti = hubunganPengganti;
+
+                const now = new Date();
+                const timeString = now.toLocaleString('ms-MY');
+
+                // Tambah ke attendance history
+                const attendanceRecord = {
+                    time: timeString,
+                    graduanId: selectedGraduate.id,
+                    graduan: selectedGraduate.namaGraduan,
+                    noBadan: selectedGraduate.noBadan,
+                    platun: selectedGraduate.platun,
+                    tetamu: selectedGraduate.tetamu.namaTetamu,
+                    hubungan: selectedGraduate.tetamu.hubungan,
+                    status: selectedGraduate.tetamu.status,
+                    pengganti: namaPengganti || '-',
+                    hubunganPengganti: hubunganPengganti || '-'
+                };
+
+                attendanceHistory.unshift(attendanceRecord);
+                
+                // Simpan ke Google Sheets (dalam praktikalnya)
+                saveToGoogleSheet(attendanceRecord, 'Attendance');
+
+                const successMessage = document.getElementById('successMessage');
+                if (successMessage) {
+                    successMessage.style.display = 'block';
+                    setTimeout(() => {
+                        successMessage.style.display = 'none';
+                    }, 3000);
+                }
+
+                renderGraduates();
+                refreshAttendanceLog();
+                calculateStatistics();
+
+            } catch (error) {
+                showMessage('error', 'Ralat menyimpan data: ' + error.message);
+            } finally {
+                setLoadingState(false);
+            }
+        }
+
+        // ... (FUNGSI LAIN YANG SAMA DARI SEBELUM) ...
+
+        // Initialize system
+        function initializeSystem() {
+            try {
+                console.log('Initializing online convocation system...');
+                
+                // Setup event listeners
+                const fileInput = document.getElementById('fileInput');
+                if (fileInput) {
+                    fileInput.addEventListener('change', handleFileSelect);
+                }
+
+                const searchInput = document.getElementById('searchInput');
+                if (searchInput) {
+                    searchInput.addEventListener('input', handleSearchInput);
+                    searchInput.addEventListener('keypress', handleSearchKeyPress);
+                }
+
+                const filterContainer = document.getElementById('filterButtons');
+                if (filterContainer) {
+                    filterContainer.addEventListener('click', handleFilterClick);
+                }
+
+                // Setup drag and drop
+                const uploadArea = document.getElementById('uploadArea');
+                if (uploadArea) {
+                    uploadArea.addEventListener('dragover', (e) => {
+                        e.preventDefault();
+                        uploadArea.classList.add('dragover');
+                    });
+                    
+                    uploadArea.addEventListener('dragleave', () => {
+                        uploadArea.classList.remove('dragover');
+                    });
+                    
+                    uploadArea.addEventListener('drop', (e) => {
+                        e.preventDefault();
+                        uploadArea.classList.remove('dragover');
+                        
+                        if (e.dataTransfer.files.length) {
+                            processFile(e.dataTransfer.files[0]);
+                        }
+                    });
+                }
+
+                console.log('System initialized! Ready to connect to Google Sheets.');
+                
+            } catch (error) {
+                console.error('System initialization error:', error);
+                showMessage('error', 'Ralat memulakan sistem: ' + error.message);
+            }
+        }
+
+        // Initialize when DOM is ready
+        document.addEventListener('DOMContentLoaded', initializeSystem);
+    </script>
+</body>
+</html>
